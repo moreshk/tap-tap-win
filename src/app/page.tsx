@@ -54,6 +54,15 @@ const TapTapGame = () => {
   const [priceData, setPriceData] = useState<PriceData[]>([]);
   const [tiles, setTiles] = useState<Tile[]>([]);
 
+  // Static initial time window - calculated once and stored
+  const [initialTimeWindow] = useState(() => {
+    const now = Date.now();
+    return {
+      min: now - 30000, // Show last 30 seconds initially (left third)  
+      max: now + 60000  // Plus 60 seconds future initially
+    };
+  });
+
   // Refs
   const wsRef = useRef<WebSocket | null>(null);
   const chartRef = useRef<ChartJS<'line', PriceData[]> | null>(null);
@@ -62,7 +71,7 @@ const TapTapGame = () => {
   const lastUpdateTimeRef = useRef<number>(0);
 
   // Configuration
-  const UPDATE_INTERVAL = 500; // Update chart every 500ms
+  const UPDATE_INTERVAL = 1000; // Update chart every 1000ms to reduce interference with user panning
   const INITIAL_DATA_POINTS = 50;
 
   // Generate initial historical data
@@ -157,14 +166,31 @@ const TapTapGame = () => {
         return newData;
       });
       
-      // Just update chart data - let user control panning manually
-      if (chartRef.current) {
-        chartRef.current.update('none'); // Update data only without animation
+      // Update chart data only if user is definitely not interacting
+      if (chartRef.current && !isUserInteracting.current) {
+        // Store current scales before update to preserve pan position
+        const chart = chartRef.current;
+        const currentXMin = chart.scales.x?.min;
+        const currentXMax = chart.scales.x?.max;
+        const currentYMin = chart.scales.y?.min; 
+        const currentYMax = chart.scales.y?.max;
+        
+        // Update chart without animation
+        chart.update('none');
+        
+        // Restore previous view if it was different from initial
+        if (currentXMin && currentXMax && 
+            (currentXMin !== initialTimeWindow.min || currentXMax !== initialTimeWindow.max)) {
+          chart.zoomScale('x', { min: currentXMin, max: currentXMax }, 'none');
+        }
+        if (currentYMin && currentYMax) {
+          chart.zoomScale('y', { min: currentYMin, max: currentYMax }, 'none');
+        }
       }
       
       lastUpdateTimeRef.current = now;
     }
-  }, []);
+  }, [initialTimeWindow.min, initialTimeWindow.max]); // Add missing dependencies
 
   // Handle chart clicks for tile placement
   const handleChartClick = useCallback((event: ChartEvent, elements: ActiveElement[], chart: ChartJS) => {
@@ -274,6 +300,65 @@ const TapTapGame = () => {
     };
   }, [connectWebSocket, processBufferedData]);
 
+  // Track user interaction to pause updates during panning
+  const isUserInteracting = useRef(false);
+  const lastPanTime = useRef(0);
+
+  // Add pan interaction tracking when chart is ready
+  useEffect(() => {
+    if (chartRef.current) {
+      const chart = chartRef.current;
+      const canvas = chart.canvas;
+      
+      const handlePanStart = () => {
+        isUserInteracting.current = true;
+        lastPanTime.current = Date.now();
+        console.log('🖱️ User started panning - pausing chart updates');
+      };
+      
+      const handlePanEnd = () => {
+        lastPanTime.current = Date.now();
+        setTimeout(() => {
+          // Extra check: only resume if enough time has passed since last pan
+          if (Date.now() - lastPanTime.current >= 1000) {
+            isUserInteracting.current = false;
+            console.log('🖱️ User stopped panning - resuming chart updates');
+          }
+        }, 1000); // Longer delay to ensure pan operation is completely finished
+      };
+      
+      // Add event listeners for mouse and touch events (more comprehensive)
+      canvas.addEventListener('mousedown', handlePanStart);
+      canvas.addEventListener('mouseup', handlePanEnd);
+      canvas.addEventListener('mouseleave', handlePanEnd);
+      canvas.addEventListener('touchstart', handlePanStart);
+      canvas.addEventListener('touchend', handlePanEnd);
+      canvas.addEventListener('touchcancel', handlePanEnd);
+      
+      // Also listen for wheel events which can interfere with panning
+      const handleWheel = () => {
+        isUserInteracting.current = true;
+        lastPanTime.current = Date.now();
+        setTimeout(() => {
+          if (Date.now() - lastPanTime.current >= 500) {
+            isUserInteracting.current = false;
+          }
+        }, 500);
+      };
+      canvas.addEventListener('wheel', handleWheel);
+      
+      return () => {
+        canvas.removeEventListener('mousedown', handlePanStart);
+        canvas.removeEventListener('mouseup', handlePanEnd);
+        canvas.removeEventListener('mouseleave', handlePanEnd);
+        canvas.removeEventListener('touchstart', handlePanStart);
+        canvas.removeEventListener('touchend', handlePanEnd);
+        canvas.removeEventListener('touchcancel', handlePanEnd);
+        canvas.removeEventListener('wheel', handleWheel);
+      };
+    }
+  }, [priceData.length]); // Run when chart has data
+
   // Connection status styling
   const getConnectionStatusColor = () => {
     switch (connectionStatus) {
@@ -296,7 +381,9 @@ const TapTapGame = () => {
         fill: false,
         tension: 0.1,
         pointRadius: 0, // Hide points on the main line
-        pointHoverRadius: 4
+        pointHoverRadius: 0, // Also hide hover points
+        pointBorderWidth: 0, // No point borders
+        pointBackgroundColor: 'transparent', // Transparent points
       },
       // Tiles dataset (future target points)
       {
@@ -319,9 +406,18 @@ const TapTapGame = () => {
     ]
   };
 
+  
   const chartOptions = {
     responsive: true,
     maintainAspectRatio: false,
+    layout: {
+      padding: 0
+    },
+    elements: {
+      point: {
+        hoverRadius: 0 // Prevent hover effects that might interfere
+      }
+    },
     animation: {
       duration: 0, // Disable all animations to prevent snapping
     },
@@ -378,8 +474,31 @@ const TapTapGame = () => {
       zoom: {
         pan: {
           enabled: true,
-          mode: 'x' as const,
+          mode: 'xy' as const, // Allow both horizontal and vertical panning
           modifierKey: undefined, // Allow drag without modifier keys
+          threshold: 5, // Minimum distance to start panning (reduces accidental panning)
+          rangeMin: {
+            x: null, // No minimum time limit - can pan to any past time
+            y: null  // No minimum price limit
+          },
+          rangeMax: {
+            x: null, // No maximum time limit - can pan to unlimited future
+            y: null  // No maximum price limit
+          },
+          onPanStart: () => {
+            isUserInteracting.current = true;
+            lastPanTime.current = Date.now();
+            console.log('🖱️ Pan started via zoom plugin');
+            return true; // Allow the pan to start
+          },
+          onPanComplete: () => {
+            lastPanTime.current = Date.now();
+            setTimeout(() => {
+              isUserInteracting.current = false;
+              console.log('🖱️ Pan completed via zoom plugin');
+            }, 1000); // Longer delay to ensure no interference
+            return true; // Pan completed successfully
+          }
         },
         zoom: {
           wheel: {
@@ -388,7 +507,11 @@ const TapTapGame = () => {
           pinch: {
             enabled: true
           },
-          mode: 'x' as const,
+          mode: 'xy' as const, // Allow both horizontal and vertical zooming
+          limits: {
+            x: {min: null, max: null}, // No time limits for zooming
+            y: {min: null, max: null}  // No price limits for zooming
+          }
         }
       }
     },
@@ -398,10 +521,11 @@ const TapTapGame = () => {
         display: true,
         title: {
           display: true,
-          text: 'Time (Pan to explore full session history) →'
+          text: 'Time (Pan left: history • Pan right: unlimited future) →'
         },
-        min: Date.now() - 60000, // Start showing last 60 seconds
-        max: Date.now() + 60000, // Plus 60 seconds future
+        // Set static initial view window but allow panning beyond it
+        min: initialTimeWindow.min,
+        max: initialTimeWindow.max,
         time: {
           displayFormats: {
             second: 'HH:mm:ss',
@@ -442,12 +566,12 @@ const TapTapGame = () => {
               🎯 Tap Tap Win - Bitcoin Price Game
             </h1>
             <p className="text-sm text-gray-600 mb-2">
-              Drag to pan left/right • Wheel to zoom • Click anywhere to place squares • Pan right for future tiles
+              Free panning in all directions • Initial 30s window • Drag to pan unlimited • Wheel to zoom • Click to place tiles
             </p>
             
             <div className="flex flex-col sm:flex-row sm:items-center gap-2 mb-2">
               <p className="text-xs text-gray-500">
-                💡 Shows ~2min window • Pan to see full session history • Data never deleted • No auto-jumping
+                💡 Starts at 1/3 width • Pan left: full history • Pan right: unlimited future • No snap-back behavior
               </p>
               <div className="flex gap-2">
                 <button
@@ -459,7 +583,11 @@ const TapTapGame = () => {
                 <button
                   onClick={() => {
                     if (chartRef.current) {
-                      chartRef.current.resetZoom();
+                      // Reset to the static initial time window instead of current time
+                      chartRef.current.zoomScale('x', {
+                        min: initialTimeWindow.min, 
+                        max: initialTimeWindow.max
+                      }, 'default');
                     }
                   }}
                   className="px-3 py-1 bg-gray-500 text-white text-xs rounded hover:bg-gray-600 transition-colors"
@@ -470,7 +598,7 @@ const TapTapGame = () => {
             </div>
             
             <div className="text-xs text-blue-600 mb-2">
-              📍 Drag to pan • Click chart → Places 🟥 red square • Zoom with wheel • Pan right for future placement area
+              📍 Free panning enabled • Drag to pan unlimited (↕️↔️) • Click chart → Places 🟥 red tile • Position persists
             </div>
           </div>
           
