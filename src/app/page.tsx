@@ -1,430 +1,562 @@
-"use client";
+'use client';
 
-import { useEffect, useRef, useState } from "react";
-import { createChart, ColorType, ISeriesApi, IChartApi, MouseEventParams, Time } from "lightweight-charts";
+import { useState, useEffect, useRef, useCallback } from 'react';
+import {
+  Chart as ChartJS,
+  CategoryScale,
+  LinearScale,
+  TimeScale,
+  PointElement,
+  LineElement,
+  Title,
+  Tooltip,
+  Legend,
+  ChartEvent,
+  ActiveElement,
+  TooltipItem,
+  LegendItem
+} from 'chart.js';
+import zoomPlugin from 'chartjs-plugin-zoom';
+import { Line } from 'react-chartjs-2';
+import 'chartjs-adapter-date-fns';
+
+// Register Chart.js components
+ChartJS.register(
+  CategoryScale,
+  LinearScale,
+  TimeScale,
+  PointElement,
+  LineElement,
+  Title,
+  Tooltip,
+  Legend,
+  zoomPlugin
+);
+
+// Types
+interface PriceData {
+  x: Date;
+  y: number;
+}
 
 interface Tile {
   id: string;
   price: number;
-  timestamp: number;
+  date: Date;
   x: number;
   y: number;
 }
 
-interface PriceData {
-  time: Time;
-  value: number;
-}
-
-export default function TapTapGame() {
-  const chartContainerRef = useRef<HTMLDivElement | null>(null);
-  const seriesRef = useRef<ISeriesApi<"Line"> | null>(null);
-  const chartRef = useRef<IChartApi | null>(null);
-  const priceBufferRef = useRef<PriceData[]>([]);
-  const lastUpdateTimeRef = useRef<number>(0);
-  
-  const [currentPrice, setCurrentPrice] = useState<number | null>(null);
-  const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'disconnected' | 'reconnecting'>('connecting');
+const TapTapGame = () => {
+  // State management
+  const [currentPrice, setCurrentPrice] = useState<number>(0);
+  const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'disconnected'>('connecting');
+  const [priceData, setPriceData] = useState<PriceData[]>([]);
   const [tiles, setTiles] = useState<Tile[]>([]);
 
-  // Cache management
-  const BUFFER_SIZE = 1000; // Keep last 1000 data points
-  const UPDATE_INTERVAL = 250; // Update chart every 250ms
+  // Refs
+  const wsRef = useRef<WebSocket | null>(null);
+  const chartRef = useRef<ChartJS<'line', PriceData[]> | null>(null);
+  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const priceBufferRef = useRef<PriceData[]>([]);
+  const lastUpdateTimeRef = useRef<number>(0);
 
-  useEffect(() => {
-    if (!chartContainerRef.current) {
-      console.log('Chart container not ready'); // Debug log
+  // Configuration
+  const UPDATE_INTERVAL = 500; // Update chart every 500ms
+  const MAX_DATA_POINTS = 200; // Keep last 200 data points
+  const INITIAL_DATA_POINTS = 50;
+
+  // Generate initial historical data
+  const generateInitialData = useCallback((latestPrice: number): PriceData[] => {
+    const data: PriceData[] = [];
+    const now = new Date();
+    let price = latestPrice;
+    
+    for (let i = INITIAL_DATA_POINTS; i >= 0; i--) {
+      const date = new Date(now.getTime() - i * 2000); // 2 second intervals for better spread
+      const change = (Math.random() - 0.5) * 200; // More price movement for visual interest
+      price += change;
+      
+      data.push({
+        x: date,
+        y: Math.max(price, latestPrice * 0.95) // Prevent too low prices
+      });
+    }
+    
+    return data;
+  }, []);
+
+  // WebSocket connection and data handling
+  const connectWebSocket = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
       return;
     }
 
-    console.log('Creating chart...'); // Debug log
+    setConnectionStatus('connecting');
+    console.log('🔗 Connecting to Binance WebSocket...');
 
-    // Create chart
-    const chart = createChart(chartContainerRef.current, {
-      layout: {
-        background: { type: ColorType.Solid, color: "transparent" },
-        textColor: "#333",
-      },
-      rightPriceScale: {
-        visible: true,
-        borderVisible: false,
-        scaleMargins: {
-          top: 0.1,
-          bottom: 0.1,
-        },
-      },
-      timeScale: {
-        rightOffset: 12,
-        fixLeftEdge: false,
-        borderVisible: false,
-        timeVisible: true,
-        secondsVisible: false,
-        barSpacing: 8,
-        tickMarkMaxCharacterLength: 8,
-      },
-      grid: {
-        vertLines: { color: "#f0f0f0" },
-        horzLines: { color: "#f0f0f0" },
-      },
-      crosshair: {
-        mode: 1,
-        vertLine: {
-          width: 1,
-          color: '#758696',
-          style: 2,
-        },
-        horzLine: {
-          width: 1,
-          color: '#758696',
-          style: 2,
-        },
-      },
-      handleScroll: {
-        mouseWheel: true,
-        pressedMouseMove: true,
-        horzTouchDrag: true,
-        vertTouchDrag: false,
-      },
-      handleScale: {
-        axisPressedMouseMove: {
-          time: true,
-          price: true,
-        },
-        axisDoubleClickReset: {
-          time: true,
-          price: true,
-        },
-        mouseWheel: true,
-        pinch: true,
-      },
-      width: chartContainerRef.current.clientWidth,
-      height: 400,
-    });
+    const ws = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@trade');
+    wsRef.current = ws;
 
-    const series = chart.addLineSeries({
-      color: '#f7931a',
-      lineWidth: 2,
-      crosshairMarkerVisible: true,
-      crosshairMarkerRadius: 6,
-      crosshairMarkerBorderColor: '#f7931a',
-      crosshairMarkerBackgroundColor: '#f7931a',
-    });
-
-    seriesRef.current = series;
-    chartRef.current = chart;
-    
-    console.log('Chart and series created successfully'); // Debug log
-
-    // Buffer management functions
-    const addToBuffer = (data: PriceData) => {
-      priceBufferRef.current.push(data);
-      // Keep only last BUFFER_SIZE data points
-      if (priceBufferRef.current.length > BUFFER_SIZE) {
-        priceBufferRef.current = priceBufferRef.current.slice(-BUFFER_SIZE);
-      }
+    ws.onopen = () => {
+      console.log('✅ WebSocket connected');
+      setConnectionStatus('connected');
     };
 
-    const initializeChartData = (initialPrice: number, timestamp: Time) => {
-      const baseTime = timestamp as number;
-      const historicalData: PriceData[] = [];
-      
-      // Create 10 minutes of historical data
-      for (let i = 10; i >= 0; i--) {
-        const time = (baseTime - (i * 30)) as Time; // Every 30 seconds
-        const priceVariation = (Math.random() - 0.5) * 100; // Random variation ±50
-        historicalData.push({
-          time,
-          value: initialPrice + priceVariation
-        });
-      }
-      
-      // Add to buffer
-      priceBufferRef.current = historicalData;
-      
-      // Set initial data
-      if (seriesRef.current) {
-        console.log('Setting initial chart data with', historicalData.length, 'points');
-        seriesRef.current.setData(historicalData);
-      }
-    };
-
-    // Smooth chart update function
-    let isUserInteracting = false;
-    const updateChartSmooth = () => {
-      const now = Date.now();
-      if (now - lastUpdateTimeRef.current >= UPDATE_INTERVAL && seriesRef.current) {
-        const buffer = priceBufferRef.current;
-        if (buffer.length > 0) {
-          // Get the latest data point
-          const latestData = buffer[buffer.length - 1];
-          seriesRef.current.update(latestData);
-          
-          // Only auto-scroll if user is not manually panning
-          if (chartRef.current && !isUserInteracting) {
-            const timeScale = chartRef.current.timeScale();
-            const logicalRange = timeScale.getVisibleLogicalRange();
-            
-            // Check if we're near the end (within 10% of the range)
-            if (logicalRange) {
-              const bufferLength = buffer.length;
-              const endThreshold = bufferLength - (bufferLength * 0.1);
-              if (logicalRange.to >= endThreshold) {
-                timeScale.scrollToRealTime();
-              }
-            }
-          }
-        }
-        lastUpdateTimeRef.current = now;
-      }
-    };
-
-    // Track user interaction
-    if (chartRef.current) {
-      chartRef.current.timeScale().subscribeVisibleLogicalRangeChange(() => {
-        // User is interacting with the chart
-        isUserInteracting = true;
-        // Reset the flag after 2 seconds of no interaction
-        setTimeout(() => {
-          isUserInteracting = false;
-        }, 2000);
-      });
-    }
-
-    // Handle chart clicks for tile placement
-    chart.subscribeClick((param: MouseEventParams) => {
-      console.log('Chart clicked!', { point: param.point, currentPrice }); // Debug log
-      
-      if (param.point) {
-        const price = series.coordinateToPrice(param.point.y);
-        const time = chart.timeScale().coordinateToTime(param.point.x);
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        const price = parseFloat(data.p);
         
-        console.log('Click coordinates:', { price, time }); // Debug log
-        
-        if (price !== null && time !== null) {
-          const newTile: Tile = {
-            id: Date.now().toString(),
-            price: Number(price.toFixed(2)),
-            timestamp: typeof time === 'number' ? time : Math.floor(Date.now() / 1000),
-            x: param.point.x,
-            y: param.point.y,
+        if (!isNaN(price)) {
+          const newDataPoint: PriceData = {
+            x: new Date(),
+            y: price
           };
           
-          console.log('Creating tile:', newTile); // Debug log
-          setTiles(prev => [...prev, newTile]);
-        }
-      }
-    });
-
-    // WebSocket connection with reconnection logic
-    let ws: WebSocket;
-    let hasInitialData = false; // Track if we've set initial data
-    let reconnectTimeout: NodeJS.Timeout;
-    let isCleanupCalled = false;
-
-    const connectWebSocket = () => {
-      if (isCleanupCalled) return;
-      
-      console.log('Connecting to WebSocket...'); // Debug log
-      setConnectionStatus('connecting');
-      
-      ws = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@trade');
-
-      ws.onopen = () => {
-        console.log('WebSocket connected'); // Debug log
-        setConnectionStatus('connected');
-        // Clear any existing reconnection timeout
-        if (reconnectTimeout) {
-          clearTimeout(reconnectTimeout);
-        }
-      };
-
-      ws.onclose = () => {
-        console.log('WebSocket disconnected'); // Debug log
-        if (!isCleanupCalled) {
-          setConnectionStatus('disconnected');
-          // Attempt to reconnect after 3 seconds
-          reconnectTimeout = setTimeout(() => {
-            if (!isCleanupCalled) {
-              console.log('Attempting to reconnect...'); // Debug log
-              setConnectionStatus('reconnecting');
-              connectWebSocket();
-            }
-          }, 3000);
-        }
-      };
-
-      ws.onerror = (error) => {
-        console.error('WebSocket error:', error); // Debug log
-        if (!isCleanupCalled) {
-          setConnectionStatus('disconnected');
-        }
-      };
-
-      ws.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          const price = parseFloat(data.p);
-          const timestamp = Math.floor(data.T / 1000) as Time; // Convert to seconds
-          
-          // Initialize chart data on first price received
-          if (!hasInitialData) {
-            initializeChartData(price, timestamp);
-            hasInitialData = true;
-          }
-          
-          // Add new data point to buffer
-          const newDataPoint: PriceData = { time: timestamp, value: price };
-          addToBuffer(newDataPoint);
-          
-          // Update current price in UI
+          // Add to buffer for smooth updates
+          priceBufferRef.current.push(newDataPoint);
           setCurrentPrice(price);
-        } catch (error) {
-          console.error('Error parsing WebSocket data:', error);
         }
-      };
-    };
-
-    // Initial connection
-    connectWebSocket();
-
-    // Smooth update interval
-    const updateInterval = setInterval(updateChartSmooth, UPDATE_INTERVAL);
-
-    // Cleanup
-    return () => {
-      console.log('Cleaning up WebSocket and chart'); // Debug log
-      isCleanupCalled = true;
-      
-      // Clear update interval
-      clearInterval(updateInterval);
-      
-      // Clear reconnection timeout
-      if (reconnectTimeout) {
-        clearTimeout(reconnectTimeout);
-      }
-      
-      // Close WebSocket connection
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.close();
-      }
-      
-      chart.remove();
-    };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps - Remove currentPrice dependency to prevent re-renders
-
-  // Handle window resize
-  useEffect(() => {
-    const handleResize = () => {
-      if (chartRef.current && chartContainerRef.current) {
-        chartRef.current.applyOptions({
-          width: chartContainerRef.current.clientWidth,
-        });
+      } catch (error) {
+        console.error('❌ Error parsing WebSocket data:', error);
       }
     };
 
-    window.addEventListener('resize', handleResize);
-    return () => window.removeEventListener('resize', handleResize);
+    ws.onerror = (error) => {
+      console.error('❌ WebSocket error:', error);
+      setConnectionStatus('disconnected');
+    };
+
+    ws.onclose = () => {
+      console.log('🔌 WebSocket disconnected');
+      setConnectionStatus('disconnected');
+      
+      // Reconnect after 3 seconds
+      reconnectTimeoutRef.current = setTimeout(() => {
+        connectWebSocket();
+      }, 3000);
+    };
   }, []);
 
+  // Process buffered data and update chart
+  const processBufferedData = useCallback(() => {
+    const now = Date.now();
+    if (now - lastUpdateTimeRef.current >= UPDATE_INTERVAL && priceBufferRef.current.length > 0) {
+      const buffer = [...priceBufferRef.current];
+      priceBufferRef.current = [];
+      
+      setPriceData(prevData => {
+        const newData = [...prevData];
+        
+        // Add new data points
+        buffer.forEach(point => {
+          newData.push(point);
+        });
+        
+        // Keep only last MAX_DATA_POINTS
+        const trimmedData = newData.slice(-MAX_DATA_POINTS);
+        
+        return trimmedData;
+      });
+      
+      // Update chart time range to keep current time visible
+      if (chartRef.current) {
+        const chart = chartRef.current;
+        chart.options.scales!.x!.min = now - 45000; // 45 seconds ago
+        chart.options.scales!.x!.max = now + 60000;  // 60 seconds future
+        chart.update('none'); // Update without animation for performance
+      }
+      
+      lastUpdateTimeRef.current = now;
+    }
+  }, []);
+
+  // Handle chart clicks for tile placement
+  const handleChartClick = useCallback((event: ChartEvent, elements: ActiveElement[], chart: ChartJS) => {
+    if (!chart || !event.native) {
+      return;
+    }
+
+    console.log('🎯 Chart clicked!');
+
+    const rect = (event.native.target as HTMLCanvasElement).getBoundingClientRect();
+    const canvasPosition = {
+      x: (event.native as MouseEvent).clientX - rect.left,
+      y: (event.native as MouseEvent).clientY - rect.top
+    };
+    
+    console.log('📍 Canvas position:', canvasPosition);
+    
+    const dataX = chart.scales.x.getValueForPixel(canvasPosition.x);
+    const dataY = chart.scales.y.getValueForPixel(canvasPosition.y);
+    
+    console.log('🔄 Raw coordinates:', { dataX, dataY, type: typeof dataX, typeY: typeof dataY });
+
+    if (dataX && dataY && typeof dataX === 'number' && typeof dataY === 'number') {
+      const clickTime = new Date(dataX);
+      const currentTime = new Date();
+      
+      console.log('⏰ Time conversion:', {
+        clickTime: clickTime.toLocaleString(),
+        currentTime: currentTime.toLocaleString(),
+        diff: clickTime.getTime() - currentTime.getTime(),
+        diffSeconds: (clickTime.getTime() - currentTime.getTime()) / 1000
+      });
+      
+      // Allow placing tiles anywhere - remove future restriction for testing
+      // if (clickTime.getTime() <= currentTime.getTime() + 2000) {
+      //   alert('⚠️ Tiles can only be placed 2+ seconds in the future!');
+      //   return;
+      // }
+      
+      // Create new tile
+      const newTile: Tile = {
+        id: Date.now().toString(),
+        price: dataY,
+        date: clickTime,
+        x: canvasPosition.x,
+        y: canvasPosition.y
+      };
+      
+      setTiles(prev => [...prev, newTile]);
+      console.log('✅ Added tile:', {
+        price: dataY.toFixed(2),
+        time: clickTime.toLocaleString(),
+        relativeTime: clickTime > currentTime ? 'future' : 'past',
+        timeDiff: Math.round((clickTime.getTime() - currentTime.getTime()) / 1000)
+      });
+    } else {
+      console.log('❌ Invalid coordinates - could not convert click to chart data');
+    }
+  }, []);
+
+  // Remove tile
+  const removeTile = useCallback((id: string) => {
+    setTiles(prev => prev.filter(tile => tile.id !== id));
+  }, []);
+
+  // Add test tile at future time
+  const addTestTile = useCallback(() => {
+    if (currentPrice > 0) {
+      const futureDate = new Date(Date.now() + 15000); // 15 seconds in future
+      const testPrice = currentPrice + (Math.random() - 0.5) * 500; // Random price around current
+      
+      const newTile: Tile = {
+        id: Date.now().toString(),
+        price: testPrice,
+        date: futureDate,
+        x: 0, // Will be positioned correctly by Chart.js
+        y: 0
+      };
+      
+      setTiles(prev => [...prev, newTile]);
+    }
+  }, [currentPrice]);
+
+  // Initialize data and WebSocket
+  useEffect(() => {
+    // Generate initial data when we first get a price
+    if (currentPrice > 0 && priceData.length === 0) {
+      const initialData = generateInitialData(currentPrice);
+      setPriceData(initialData);
+    }
+  }, [currentPrice, priceData.length, generateInitialData]);
+
+  useEffect(() => {
+    connectWebSocket();
+
+    // Process buffered data regularly
+    const processingInterval = setInterval(processBufferedData, UPDATE_INTERVAL);
+
+    return () => {
+      if (wsRef.current) {
+        wsRef.current.close();
+      }
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+      }
+      clearInterval(processingInterval);
+    };
+  }, [connectWebSocket, processBufferedData]);
+
+  // Connection status styling
   const getConnectionStatusColor = () => {
     switch (connectionStatus) {
       case 'connected': return 'text-green-500';
       case 'connecting': return 'text-yellow-500';
-      case 'reconnecting': return 'text-orange-500';
       case 'disconnected': return 'text-red-500';
     }
   };
 
-  const removeTile = (tileId: string) => {
-    setTiles(prev => prev.filter(tile => tile.id !== tileId));
+  // Chart configuration
+  const chartData = {
+    datasets: [
+      // Price line dataset
+      {
+        label: 'BTC/USDT',
+        data: priceData,
+        borderColor: '#f7931a',
+        backgroundColor: 'rgba(247, 147, 26, 0.1)',
+        borderWidth: 2,
+        fill: false,
+        tension: 0.1,
+        pointRadius: 0, // Hide points on the main line
+        pointHoverRadius: 4,
+      },
+      // Tiles dataset (future target points)
+      {
+        label: 'Target Tiles',
+        data: tiles.map(tile => ({
+          x: tile.date,
+          y: tile.price
+        })),
+        borderColor: '#ef4444',
+        backgroundColor: '#ef4444',
+        borderWidth: 3,
+        fill: false,
+        showLine: false, // Show only points, no connecting lines
+        pointRadius: 8,
+        pointHoverRadius: 12,
+        pointStyle: 'rectRot', // Square diamond shape
+        pointBorderColor: '#ffffff',
+        pointBorderWidth: 2,
+      }
+    ]
+  };
+
+  const chartOptions = {
+    responsive: true,
+    maintainAspectRatio: false,
+    interaction: {
+      intersect: false,
+      mode: 'index' as const,
+    },
+    onClick: handleChartClick,
+    plugins: {
+      legend: {
+        position: 'top' as const,
+        labels: {
+          filter: function(legendItem: LegendItem) {
+            // Only show the price line in legend
+            return legendItem.datasetIndex === 0;
+          }
+        }
+      },
+      title: {
+        display: true,
+        text: '🎯 Bitcoin Price - Click to Place Future Tiles',
+        font: {
+          size: 16,
+          weight: 'bold' as const
+        }
+      },
+      tooltip: {
+        callbacks: {
+          title: function(tooltipItems: TooltipItem<'line'>[]) {
+            const date = new Date(tooltipItems[0].parsed.x);
+            return date.toLocaleString();
+          },
+          label: function(context: TooltipItem<'line'>) {
+            if (context.datasetIndex === 0) {
+              return `Price: $${context.parsed.y.toFixed(2)}`;
+            } else {
+              const isFuture = new Date(context.parsed.x) > new Date();
+              return `🎯 Target: $${context.parsed.y.toFixed(2)} ${isFuture ? '(Future)' : '(Past)'}`;
+            }
+          }
+        }
+      },
+      zoom: {
+        pan: {
+          enabled: true,
+          mode: 'x' as const,
+        },
+        zoom: {
+          wheel: {
+            enabled: true,
+          },
+          pinch: {
+            enabled: true
+          },
+          mode: 'x' as const,
+        }
+      }
+    },
+    scales: {
+      x: {
+        type: 'time' as const,
+        display: true,
+        title: {
+          display: true,
+          text: 'Time (Pan right for future placement) →'
+        },
+        min: Date.now() - 45000, // 45 seconds ago
+        max: Date.now() + 60000, // 60 seconds in future
+        time: {
+          displayFormats: {
+            second: 'HH:mm:ss',
+            minute: 'HH:mm',
+            hour: 'HH:mm'
+          },
+          tooltipFormat: 'MMM dd, HH:mm:ss',
+          unit: 'second' as const
+        },
+        ticks: {
+          source: 'auto' as const,
+          maxTicksLimit: 8,
+          stepSize: 5 // Show ticks every 5 seconds
+        }
+      },
+      y: {
+        display: true,
+        title: {
+          display: true,
+          text: 'Price (USD)'
+        },
+        ticks: {
+          callback: function(value: string | number) {
+            return '$' + Number(value).toLocaleString();
+          }
+        }
+      }
+    }
   };
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-gray-50 to-gray-100 p-4 sm:p-6 lg:p-8">
-      <div className="max-w-7xl mx-auto">
+    <div className="min-h-screen bg-gray-50 p-4">
+      <div className="max-w-6xl mx-auto">
         {/* Header */}
-        <div className="mb-6">
-          <h1 className="text-3xl sm:text-4xl font-bold text-gray-900 mb-2">
-            Bitcoin Tap-Tap Game
-          </h1>
-          <div className="flex flex-col sm:flex-row sm:items-center gap-4">
-            <div className="flex items-center gap-2">
-              <span className="text-sm text-gray-600">Status:</span>
-              <span className={`text-sm font-medium ${getConnectionStatusColor()}`}>
-                {connectionStatus.charAt(0).toUpperCase() + connectionStatus.slice(1)}
-              </span>
+        <div className="bg-white rounded-lg shadow-lg p-4 mb-6">
+          <div className="mb-4">
+            <h1 className="text-2xl font-bold text-gray-900 mb-2">
+              🎯 Tap Tap Win - Bitcoin Price Game
+            </h1>
+            <p className="text-sm text-gray-600 mb-2">
+              Drag to pan left/right • Wheel to zoom • Click to place target tiles anywhere on timeline
+            </p>
+            
+            <div className="flex flex-col sm:flex-row sm:items-center gap-2 mb-2">
+              <p className="text-xs text-gray-500">
+                💡 Chart.js time axis shows past + future • Pan right to see future timeline • Native coordinate system
+              </p>
+              <div className="flex gap-2">
+                <button
+                  onClick={addTestTile}
+                  className="px-3 py-1 bg-blue-500 text-white text-xs rounded hover:bg-blue-600 transition-colors"
+                >
+                  Add Test Tile
+                </button>
+                <button
+                  onClick={() => {
+                    if (chartRef.current) {
+                      chartRef.current.resetZoom();
+                    }
+                  }}
+                  className="px-3 py-1 bg-gray-500 text-white text-xs rounded hover:bg-gray-600 transition-colors"
+                >
+                  Reset View
+                </button>
+              </div>
             </div>
-            {currentPrice && (
-              <div className="flex items-center gap-2">
-                <span className="text-sm text-gray-600">Current BTC Price:</span>
-                <span className="text-lg font-bold text-orange-500">
-                  ${currentPrice.toLocaleString()}
-                </span>
+            
+            <div className="text-xs text-blue-600 mb-2">
+              📍 Click chart → Places 🎯 red diamond at exact time/price • Drag to pan • Wheel to zoom • Tiles move with chart
+            </div>
+          </div>
+          
+          {/* Chart Container */}
+          <div className="w-full h-[500px]">
+            {priceData.length > 0 ? (
+              <Line 
+                ref={chartRef}
+                data={chartData} 
+                options={chartOptions}
+              />
+            ) : (
+              <div className="w-full h-full border border-gray-200 rounded bg-white flex items-center justify-center">
+                <div className="text-center">
+                  <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 mx-auto mb-2"></div>
+                  <p className="text-gray-500">Loading Bitcoin price data...</p>
+                  <p className="text-xs text-gray-400">Status: {connectionStatus}</p>
+                </div>
               </div>
             )}
           </div>
-        </div>
 
-        {/* Chart Container */}
-        <div className="bg-white rounded-lg shadow-lg p-4 mb-6">
-          <div className="mb-4">
-            <h2 className="text-xl font-semibold text-gray-800 mb-2">
-              Live Bitcoin Price Chart
-            </h2>
-            <p className="text-sm text-gray-600 mb-2">
-              Click anywhere on the chart to place a tile. Your tiles will appear below.
-            </p>
-            <p className="text-xs text-gray-500">
-              💡 Use mouse wheel to zoom, drag to pan left/right, or double-click to reset view
-            </p>
+          {/* Status */}
+          <div className="mt-4 flex flex-col sm:flex-row sm:items-center gap-4">
+            <div className="text-sm">
+              <span className="text-gray-600">Status: </span>
+              <span className={`font-semibold ${getConnectionStatusColor()}`}>
+                {connectionStatus}
+              </span>
+            </div>
+            <div className="text-sm">
+              <span className="text-gray-600">Current BTC Price: </span>
+              <span className="font-bold text-green-600">
+                ${currentPrice.toFixed(2)}
+              </span>
+            </div>
+            <div className="text-sm">
+              <span className="text-gray-600">Data Points: </span>
+              <span className="font-semibold text-blue-600">
+                {priceData.length}
+              </span>
+            </div>
+            <div className="text-sm">
+              <span className="text-gray-600">Active Tiles: </span>
+              <span className="font-semibold text-red-600">
+                {tiles.length}
+              </span>
+            </div>
           </div>
-          
-          <div 
-            ref={chartContainerRef} 
-            className="w-full h-[400px] border border-gray-200 rounded bg-white"
-          />
         </div>
 
-        {/* Tiles Section */}
-        <div className="bg-white rounded-lg shadow-lg p-4">
-          <h3 className="text-xl font-semibold text-gray-800 mb-4">
-            Your Tiles ({tiles.length})
-          </h3>
-          
-          {tiles.length === 0 ? (
-            <p className="text-gray-600 text-center py-8">
-              No tiles placed yet. Click on the chart to place your first tile!
-            </p>
-          ) : (
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-              {tiles.map((tile) => (
-                <div
-                  key={tile.id}
-                  className="bg-gray-50 rounded-lg p-4 border border-gray-200 hover:shadow-md transition-shadow"
-                >
-                  <div className="flex justify-between items-start mb-2">
-                    <div className="text-lg font-bold text-orange-500">
-                      ${tile.price.toLocaleString()}
+        {/* Tiles List */}
+        {tiles.length > 0 && (
+          <div className="bg-white rounded-lg shadow-lg p-4">
+            <h2 className="text-lg font-semibold text-gray-800 mb-3">
+              🎯 Active Target Tiles ({tiles.length})
+            </h2>
+            <div className="space-y-2 max-h-60 overflow-y-auto">
+              {tiles.map((tile) => {
+                const isFuture = tile.date > new Date();
+                const timeToTarget = isFuture 
+                  ? Math.round((tile.date.getTime() - Date.now()) / 1000)
+                  : Math.round((Date.now() - tile.date.getTime()) / 1000);
+                
+                return (
+                  <div key={tile.id} className="flex items-center justify-between p-3 bg-gray-50 rounded">
+                    <div className="flex items-center space-x-3">
+                      <div className="w-3 h-3 bg-red-400 rounded-full transform rotate-45"></div>
+                      <div>
+                        <p className="font-semibold text-gray-800">
+                          ${tile.price.toFixed(2)}
+                        </p>
+                        <p className="text-xs text-gray-500">
+                          {tile.date.toLocaleString()}
+                        </p>
+                        <p className={`text-xs font-medium ${isFuture ? 'text-blue-600' : 'text-orange-600'}`}>
+                          {isFuture ? `⏳ ${timeToTarget}s remaining` : `⏰ ${timeToTarget}s ago`}
+                        </p>
+                      </div>
                     </div>
                     <button
                       onClick={() => removeTile(tile.id)}
-                      className="text-red-500 hover:text-red-700 text-sm font-medium"
+                      className="px-3 py-1 bg-red-500 text-white text-xs rounded hover:bg-red-600 transition-colors"
                     >
                       Remove
                     </button>
                   </div>
-                  <div className="text-sm text-gray-600">
-                    Placed: {new Date(tile.timestamp * 1000).toLocaleTimeString()}
-                  </div>
-                  <div className="mt-2 text-xs text-gray-500">
-                    Position: ({Math.round(tile.x)}, {Math.round(tile.y)})
-                  </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
-          )}
-        </div>
+          </div>
+        )}
       </div>
     </div>
   );
-}
+};
+
+export default TapTapGame;
