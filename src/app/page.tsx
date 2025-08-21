@@ -63,7 +63,6 @@ const TapTapGame = () => {
 
   // Configuration
   const UPDATE_INTERVAL = 500; // Update chart every 500ms
-  const MAX_DATA_POINTS = 200; // Keep last 200 data points
   const INITIAL_DATA_POINTS = 50;
 
   // Generate initial historical data
@@ -154,18 +153,13 @@ const TapTapGame = () => {
           newData.push(point);
         });
         
-        // Keep only last MAX_DATA_POINTS
-        const trimmedData = newData.slice(-MAX_DATA_POINTS);
-        
-        return trimmedData;
+        // Keep all data from the session - no trimming
+        return newData;
       });
       
-      // Update chart time range to keep current time visible
+      // Just update chart data - let user control panning manually
       if (chartRef.current) {
-        const chart = chartRef.current;
-        chart.options.scales!.x!.min = now - 45000; // 45 seconds ago
-        chart.options.scales!.x!.max = now + 60000;  // 60 seconds future
-        chart.update('none'); // Update without animation for performance
+        chartRef.current.update('none'); // Update data only without animation
       }
       
       lastUpdateTimeRef.current = now;
@@ -302,7 +296,7 @@ const TapTapGame = () => {
         fill: false,
         tension: 0.1,
         pointRadius: 0, // Hide points on the main line
-        pointHoverRadius: 4,
+        pointHoverRadius: 4
       },
       // Tiles dataset (future target points)
       {
@@ -316,11 +310,11 @@ const TapTapGame = () => {
         borderWidth: 3,
         fill: false,
         showLine: false, // Show only points, no connecting lines
-        pointRadius: 8,
-        pointHoverRadius: 12,
-        pointStyle: 'rectRot', // Square diamond shape
+        pointRadius: 24, // 3x bigger tiles
+        pointHoverRadius: 24, // No hover size change
+        pointStyle: 'rect', // Square shape lying on side
         pointBorderColor: '#ffffff',
-        pointBorderWidth: 2,
+        pointBorderWidth: 2
       }
     ]
   };
@@ -328,6 +322,20 @@ const TapTapGame = () => {
   const chartOptions = {
     responsive: true,
     maintainAspectRatio: false,
+    animation: {
+      duration: 0, // Disable all animations to prevent snapping
+    },
+    animations: {
+      tension: {
+        duration: 0 // Disable line tension animations
+      },
+      x: {
+        duration: 0 // Disable x-axis animations
+      },
+      y: {
+        duration: 0 // Disable y-axis animations  
+      }
+    },
     interaction: {
       intersect: false,
       mode: 'index' as const,
@@ -371,6 +379,7 @@ const TapTapGame = () => {
         pan: {
           enabled: true,
           mode: 'x' as const,
+          modifierKey: undefined, // Allow drag without modifier keys
         },
         zoom: {
           wheel: {
@@ -389,10 +398,10 @@ const TapTapGame = () => {
         display: true,
         title: {
           display: true,
-          text: 'Time (Pan right for future placement) →'
+          text: 'Time (Pan to explore full session history) →'
         },
-        min: Date.now() - 45000, // 45 seconds ago
-        max: Date.now() + 60000, // 60 seconds in future
+        min: Date.now() - 60000, // Start showing last 60 seconds
+        max: Date.now() + 60000, // Plus 60 seconds future
         time: {
           displayFormats: {
             second: 'HH:mm:ss',
@@ -433,12 +442,12 @@ const TapTapGame = () => {
               🎯 Tap Tap Win - Bitcoin Price Game
             </h1>
             <p className="text-sm text-gray-600 mb-2">
-              Drag to pan left/right • Wheel to zoom • Click to place target tiles anywhere on timeline
+              Drag to pan left/right • Wheel to zoom • Click anywhere to place squares • Pan right for future tiles
             </p>
             
             <div className="flex flex-col sm:flex-row sm:items-center gap-2 mb-2">
               <p className="text-xs text-gray-500">
-                💡 Chart.js time axis shows past + future • Pan right to see future timeline • Native coordinate system
+                💡 Shows ~2min window • Pan to see full session history • Data never deleted • No auto-jumping
               </p>
               <div className="flex gap-2">
                 <button
@@ -461,7 +470,7 @@ const TapTapGame = () => {
             </div>
             
             <div className="text-xs text-blue-600 mb-2">
-              📍 Click chart → Places 🎯 red diamond at exact time/price • Drag to pan • Wheel to zoom • Tiles move with chart
+              📍 Drag to pan • Click chart → Places 🟥 red square • Zoom with wheel • Pan right for future placement area
             </div>
           </div>
           
@@ -517,7 +526,7 @@ const TapTapGame = () => {
         {tiles.length > 0 && (
           <div className="bg-white rounded-lg shadow-lg p-4">
             <h2 className="text-lg font-semibold text-gray-800 mb-3">
-              🎯 Active Target Tiles ({tiles.length})
+              🟥 Active Target Squares ({tiles.length})
             </h2>
             <div className="space-y-2 max-h-60 overflow-y-auto">
               {tiles.map((tile) => {
@@ -529,7 +538,7 @@ const TapTapGame = () => {
                 return (
                   <div key={tile.id} className="flex items-center justify-between p-3 bg-gray-50 rounded">
                     <div className="flex items-center space-x-3">
-                      <div className="w-3 h-3 bg-red-400 rounded-full transform rotate-45"></div>
+                      <div className="w-4 h-4 bg-red-400 rounded-sm"></div>
                       <div>
                         <p className="font-semibold text-gray-800">
                           ${tile.price.toFixed(2)}
